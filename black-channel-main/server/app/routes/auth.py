@@ -1,0 +1,154 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Request,Cookie,status
+from sqlalchemy.orm import Session
+from app.schemas import auth as auth_schemas
+from app.db.database import get_db
+from app.services import auth_services
+from app.core.config import settings
+from app.core.logger import get_logger
+from app.core import constants
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from app.core.wrappers import token_not_blacklisted 
+from app.services import auth_services
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+limiter = Limiter(key_func=get_remote_address)
+logger = get_logger(__name__)
+
+@router.post("/login", status_code=status.HTTP_200_OK)
+@limiter.limit("10/minute") 
+def login(request: Request,request_data: auth_schemas.LoginRequest, response: Response, db: Session = Depends(get_db)):
+    logger.info(constants.AUTH_LOGIN_ATTEMPT.format(username=request_data.username))
+
+    user = auth_services.authenticate_user(db, request_data.username, request_data.password)
+    if not user:
+        logger.warning(constants.AUTH_LOGIN_FAILED.format(username=request_data.username))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials"
+        )
+
+    payload = auth_services.login_user(db, user)
+    access_token = payload["access_token"]
+    refresh_token = payload["refresh_token"]
+
+    response.set_cookie(
+        key=settings.ACCESS_COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+    response.set_cookie(
+        key=settings.REFRESH_COOKIE_NAME,
+        value=refresh_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+    logger.info(constants.AUTH_LOGIN_SUCCESS.format(username=request_data.username))
+    return {
+        "status": status.HTTP_200_OK,
+        "message": "Black Channel's Drop"
+    }
+
+
+@router.post("/refresh", status_code=status.HTTP_200_OK)
+@limiter.limit("10/minute")  
+@token_not_blacklisted("refresh") 
+def refresh_token(request: Request, response: Response, db: Session = Depends(get_db)):
+    refresh_token = request.cookies.get(settings.REFRESH_COOKIE_NAME)
+    if not refresh_token:
+        logger.warning(constants.AUTH_REFRESH_FAILED.format(username="Unknown"))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing refresh token"
+        )
+
+    payload = auth_services.refresh_access_token(db, refresh_token)
+    if not payload:
+        logger.warning(constants.AUTH_REFRESH_FAILED.format(username="Unknown"))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token"
+        )
+
+    new_access_token = payload["access_token"]
+    username = payload["user"].username
+
+    response.set_cookie(
+        key=settings.ACCESS_COOKIE_NAME,
+        value=new_access_token,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+
+    logger.info(constants.AUTH_REFRESH_SUCCESS.format(username=username))
+    return {
+        "status": status.HTTP_200_OK,
+        "message": "Access token refreshed successfully"
+    }
+
+@router.post("/logout", status_code=status.HTTP_200_OK)
+@limiter.limit("10/minute")  
+@token_not_blacklisted("refresh") 
+def logout(request: Request, response: Response):
+    access_token = request.cookies.get(settings.ACCESS_COOKIE_NAME)
+    refresh_token = request.cookies.get(settings.REFRESH_COOKIE_NAME)
+
+    auth_services.logout_user(access_token, refresh_token)
+
+    if access_token:
+        response.delete_cookie(settings.ACCESS_COOKIE_NAME)
+    if refresh_token:
+        response.delete_cookie(settings.REFRESH_COOKIE_NAME)
+
+    return {
+        "status": status.HTTP_200_OK,
+        "message": "Successfully logged out"
+    }
+    
+
+@router.post("/signup", status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")  
+def signup(request: Request,request_data: auth_schemas.SignupRequest, db: Session = Depends(get_db)):
+    user = auth_services.signup_user(
+        db, 
+        request_data.username, 
+        request_data.password, 
+        request_data.email
+    )
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already exists"
+        )
+    return {"status": "pending_verification", "message": "OTP sent to your email"}
+
+
+@router.post("/verify-otp")
+@limiter.limit("10/minute")  
+def verify_otp(request: Request,request_data: auth_schemas.VerifyOTPRequest, db: Session = Depends(get_db)):
+    user, error = auth_services.verify_otp_and_create_user(db, request_data.email, request_data.otp)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+
+    return {"status": "success", "message": "User verified and created successfully"}
+
+
+
+@router.post("/resend-otp")
+@limiter.limit("10/minute")  
+def resend_otp(request: Request,request_data: auth_schemas.ResendOTPRequest):
+    response, error = auth_services.resend_otp_code(request_data.email)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    return response
+
+
